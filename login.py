@@ -51,9 +51,9 @@ class Login:
     @staticmethod
     def login() -> bool:
         user_id, user_pw = Login.getLoginInput()
-        return Login.check_password(user_id, user_pw)
+        return Login.check_password(user_id, user_pw), user_id
 
 
 if __name__ == "__main__":
     login_service = Login()
-    value = login_service.login()
+    value, user_id = login_service.login()
