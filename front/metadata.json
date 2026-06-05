@@ -1,0 +1,6 @@
+{
+  "name": "ClassFit",
+  "description": "Clean, highly-trusted classroom reservation system featuring dual language support, schedule conflicts checks, BFS recommendations, and full CRUD administration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
