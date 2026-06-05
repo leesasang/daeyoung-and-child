@@ -1,22 +1,18 @@
 """
-ClassFit database module v3
+ClassFit database module - Team A v2
 
-역할
-- SQLite DB 스키마 생성
-- CSV 기반 초기 데이터 로딩
-- 기존 수업 시간표(blocked_schedules)와 실시간 예약(reservations) 충돌 검사
-- 예약 신청/취소/조회
-- 빈 강의실 및 대체 시간 탐색
-
-v3 수정 핵심
-- 예약/현황 조회는 앱에서 캐시하지 않아 DB 반영 지연을 줄인다.
-- 예약 INSERT/DELETE는 BEGIN IMMEDIATE 트랜잭션으로 처리해 동시 클릭에 의한 중복 예약을 방지한다.
-- SQLite WAL 모드와 busy_timeout을 사용해 여러 사용자의 읽기/쓰기 충돌을 완화한다.
+변경 핵심
+- users 테이블 추가 및 사용자 조회/생성/로그인 검증 함수 추가
+- reservations 테이블에서 user_name 제거, user_id 외래키 사용
+- reservation_history 테이블 추가: 예약 생성/취소 내역을 스냅샷으로 저장
+- 기존 수업 시간표(blocked_schedules)와 실시간 예약(reservations) 충돌 검사 유지
+- SQLite WAL 모드와 BEGIN IMMEDIATE 트랜잭션으로 동시 예약 충돌 완화
 """
 
 from __future__ import annotations
 
 import csv
+import hashlib
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -30,6 +26,13 @@ BLOCKED_CSV_PATH = DATA_DIR / "blocked_schedules.csv"
 
 KOREAN_WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 
+DEFAULT_USERS = [
+    # user_name, password, role, student_id, department, email
+    ("admin", "admin123", "admin", "", "", ""),
+    ("user1", "1234", "user", "", "", ""),
+    ("user2", "1234", "user", "", "", ""),
+]
+
 
 class ClassFitError(Exception):
     """ClassFit DB 처리 중 발생하는 명시적 예외."""
@@ -39,6 +42,11 @@ def get_day_from_date(date_text: str) -> str:
     """YYYY-MM-DD 날짜를 한국어 요일 문자로 변환한다."""
     dt = datetime.strptime(date_text, "%Y-%m-%d")
     return KOREAN_WEEKDAYS[dt.weekday()]
+
+
+def hash_password(password: str) -> str:
+    """프로토타입용 단순 SHA-256 비밀번호 해시."""
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
 def connect_db() -> sqlite3.Connection:
@@ -83,6 +91,17 @@ def init_db() -> None:
             FOREIGN KEY (room_id) REFERENCES rooms(room_id)
         );
 
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_name TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            student_id TEXT UNIQUE,
+            department TEXT,
+            email TEXT UNIQUE,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS reservations (
             reservation_id INTEGER PRIMARY KEY AUTOINCREMENT,
             room_id TEXT NOT NULL,
@@ -90,10 +109,28 @@ def init_db() -> None:
             day TEXT NOT NULL,
             start_period INTEGER NOT NULL,
             end_period INTEGER NOT NULL,
-            user_name TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
             purpose TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (room_id) REFERENCES rooms(room_id)
+            FOREIGN KEY (room_id) REFERENCES rooms(room_id),
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS reservation_history (
+            history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reservation_id INTEGER,
+            action TEXT NOT NULL CHECK(action IN ('CREATE', 'CANCEL')),
+            room_id TEXT NOT NULL,
+            date TEXT NOT NULL,
+            day TEXT NOT NULL,
+            start_period INTEGER NOT NULL,
+            end_period INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            purpose TEXT,
+            action_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            memo TEXT,
+            FOREIGN KEY (room_id) REFERENCES rooms(room_id),
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
         );
 
         CREATE INDEX IF NOT EXISTS idx_blocked_room_day_period
@@ -102,11 +139,26 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_blocked_day_period
         ON blocked_schedules(day, period);
 
+        CREATE INDEX IF NOT EXISTS idx_users_user_name
+        ON users(user_name);
+
+        CREATE INDEX IF NOT EXISTS idx_reservations_user_id
+        ON reservations(user_id);
+
         CREATE INDEX IF NOT EXISTS idx_reservations_room_date_period
         ON reservations(room_id, date, start_period, end_period);
 
         CREATE INDEX IF NOT EXISTS idx_reservations_date
         ON reservations(date);
+
+        CREATE INDEX IF NOT EXISTS idx_history_user_id
+        ON reservation_history(user_id);
+
+        CREATE INDEX IF NOT EXISTS idx_history_reservation_id
+        ON reservation_history(reservation_id);
+
+        CREATE INDEX IF NOT EXISTS idx_history_room_date
+        ON reservation_history(room_id, date);
 
         CREATE INDEX IF NOT EXISTS idx_rooms_capacity
         ON rooms(capacity);
@@ -116,17 +168,33 @@ def init_db() -> None:
     conn.close()
 
 
+def _insert_default_users(cur: sqlite3.Cursor) -> None:
+    """시연용 기본 사용자를 삽입한다. 이미 존재하면 무시한다."""
+    cur.executemany(
+        """
+        INSERT OR IGNORE INTO users
+        (user_name, password_hash, role, student_id, department, email)
+        VALUES (?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''));
+        """,
+        [(name, hash_password(password), role, sid, dept, email) for name, password, role, sid, dept, email in DEFAULT_USERS],
+    )
+
+
 def reset_db_from_csv() -> None:
-    """CSV 기반으로 rooms, blocked_schedules를 재생성한다. reservations는 빈 상태로 초기화된다."""
+    """CSV 기반으로 rooms, blocked_schedules를 재생성한다. reservations/history는 빈 상태로 초기화된다."""
     init_db()
     conn = connect_db()
     cur = conn.cursor()
     try:
         cur.execute("BEGIN IMMEDIATE;")
+        cur.execute("DELETE FROM reservation_history;")
         cur.execute("DELETE FROM reservations;")
         cur.execute("DELETE FROM blocked_schedules;")
         cur.execute("DELETE FROM rooms;")
-        cur.execute("DELETE FROM sqlite_sequence WHERE name IN ('reservations', 'blocked_schedules');")
+        cur.execute("DELETE FROM users;")
+        cur.execute(
+            "DELETE FROM sqlite_sequence WHERE name IN ('reservation_history', 'reservations', 'blocked_schedules', 'users');"
+        )
 
         with open(ROOMS_CSV_PATH, "r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
@@ -138,7 +206,7 @@ def reset_db_from_csv() -> None:
                         row["building"],
                         int(row["floor"]) if row.get("floor") else None,
                         row.get("room_number", ""),
-                        row["room_name"],
+                        row.get("room_name") or row["room_id"],
                         int(row["capacity"]),
                         float(row["capacity_avg"]) if row.get("capacity_avg") else None,
                         row.get("room_type", "일반강의실"),
@@ -184,6 +252,7 @@ def reset_db_from_csv() -> None:
             blocked,
         )
 
+        _insert_default_users(cur)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -193,15 +262,138 @@ def reset_db_from_csv() -> None:
 
 
 def ensure_seed_data() -> None:
-    """DB 파일이 없거나 rooms가 비어 있으면 CSV로 초기화한다."""
+    """DB 파일이 없거나 rooms/users가 비어 있으면 CSV와 기본 사용자로 초기화한다."""
     init_db()
     conn = connect_db()
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM rooms;")
     room_count = cur.fetchone()[0]
-    conn.close()
+    cur.execute("SELECT COUNT(*) FROM users;")
+    user_count = cur.fetchone()[0]
     if room_count == 0:
+        conn.close()
         reset_db_from_csv()
+        return
+    if user_count == 0:
+        cur.execute("BEGIN IMMEDIATE;")
+        _insert_default_users(cur)
+        conn.commit()
+    conn.close()
+
+
+def create_user(
+    user_name: str,
+    password: str,
+    role: str = "user",
+    student_id: str | None = None,
+    department: str | None = None,
+    email: str | None = None,
+):
+    """사용자 추가. 성공 시 생성된 user_id를 반환한다."""
+    if not user_name or not user_name.strip():
+        return False, "사용자명은 비울 수 없습니다.", None
+    if not password:
+        return False, "비밀번호는 비울 수 없습니다.", None
+    if role not in {"user", "admin"}:
+        return False, "role은 user 또는 admin만 가능합니다.", None
+
+    conn = connect_db()
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE;")
+        cur.execute(
+            """
+            INSERT INTO users
+            (user_name, password_hash, role, student_id, department, email)
+            VALUES (?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''));
+            """,
+            (
+                user_name.strip(),
+                hash_password(password),
+                role,
+                student_id or "",
+                department or "",
+                email or "",
+            ),
+        )
+        user_id = cur.lastrowid
+        conn.commit()
+        return True, f"사용자 생성 완료: user_id {user_id}", user_id
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        return False, f"사용자 생성 실패: 중복된 user_name/student_id/email이 있습니다. ({exc})", None
+    except sqlite3.Error as exc:
+        conn.rollback()
+        return False, f"DB 오류: {exc}", None
+    finally:
+        conn.close()
+
+
+def get_user_by_id(user_id: int):
+    """user_id로 사용자 1명을 조회한다."""
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT user_id, user_name, role, student_id, department, email, created_at
+        FROM users
+        WHERE user_id = ?;
+        """,
+        (int(user_id),),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_user_by_name(user_name: str):
+    """user_name으로 사용자 1명을 조회한다."""
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT user_id, user_name, role, student_id, department, email, created_at
+        FROM users
+        WHERE user_name = ?;
+        """,
+        (user_name.strip(),),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_all_users():
+    """전체 사용자 목록을 반환한다."""
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT user_id, user_name, role, student_id, department, email, created_at
+        FROM users
+        ORDER BY user_id ASC;
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def authenticate_user(user_name: str, password: str):
+    """로그인 검증. 성공하면 사용자 정보를 반환하고 실패하면 None을 반환한다."""
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT user_id, user_name, role, student_id, department, email, created_at
+        FROM users
+        WHERE user_name = ? AND password_hash = ?;
+        """,
+        (user_name.strip(), hash_password(password)),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
 
 
 def get_conflict_details(room_id: str, date: str, start_period: int, end_period: int) -> dict:
@@ -237,10 +429,11 @@ def get_conflict_details(room_id: str, date: str, start_period: int, end_period:
 
     cur.execute(
         """
-        SELECT reservation_id, start_period, end_period, user_name, purpose
-        FROM reservations
-        WHERE room_id = ? AND date = ? AND start_period < ? AND ? < end_period
-        ORDER BY start_period ASC;
+        SELECT rv.reservation_id, rv.start_period, rv.end_period, u.user_name, rv.purpose
+        FROM reservations rv
+        JOIN users u ON rv.user_id = u.user_id
+        WHERE rv.room_id = ? AND rv.date = ? AND rv.start_period < ? AND ? < rv.end_period
+        ORDER BY rv.start_period ASC;
         """,
         (room_id, date, end_period, start_period),
     )
@@ -272,14 +465,17 @@ def get_conflict_details(room_id: str, date: str, start_period: int, end_period:
     return {"ok": True, "type": "none", "day": day, "message": "예약 가능한 시간입니다."}
 
 
-def add_reservation(room_id: str, date: str, start_period: int, end_period: int, user_name: str, purpose: str = ""):
-    """예약 신청. 트랜잭션 안에서 충돌을 재검사한 뒤 저장한다."""
+def add_reservation(room_id: str, date: str, start_period: int, end_period: int, user_id: int, purpose: str = ""):
+    """예약 신청. user_name이 아니라 user_id를 저장한다."""
     if start_period >= end_period:
         return False, "예약 실패: 종료 교시는 시작 교시보다 커야 합니다."
     if start_period < 1 or end_period > 13:
         return False, "예약 실패: 예약 가능 교시는 1~12교시입니다."
-    if not user_name or not user_name.strip():
-        return False, "예약 실패: 예약자명을 입력해야 합니다."
+
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return False, "예약 실패: 올바른 user_id가 아닙니다."
 
     try:
         day = get_day_from_date(date)
@@ -296,6 +492,11 @@ def add_reservation(room_id: str, date: str, start_period: int, end_period: int,
         if cur.fetchone() is None:
             conn.rollback()
             return False, "예약 실패: 존재하지 않는 강의실입니다."
+
+        cur.execute("SELECT user_id FROM users WHERE user_id = ?;", (user_id,))
+        if cur.fetchone() is None:
+            conn.rollback()
+            return False, "예약 실패: 존재하지 않는 user_id입니다."
 
         cur.execute(
             """
@@ -327,12 +528,22 @@ def add_reservation(room_id: str, date: str, start_period: int, end_period: int,
         cur.execute(
             """
             INSERT INTO reservations
-            (room_id, date, day, start_period, end_period, user_name, purpose)
+            (room_id, date, day, start_period, end_period, user_id, purpose)
             VALUES (?, ?, ?, ?, ?, ?, ?);
             """,
-            (room_id, date, day, start_period, end_period, user_name.strip(), purpose.strip()),
+            (room_id, date, day, start_period, end_period, user_id, purpose.strip()),
         )
         reservation_id = cur.lastrowid
+
+        cur.execute(
+            """
+            INSERT INTO reservation_history
+            (reservation_id, action, room_id, date, day, start_period, end_period, user_id, purpose, memo)
+            VALUES (?, 'CREATE', ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (reservation_id, room_id, date, day, start_period, end_period, user_id, purpose.strip(), "예약 생성"),
+        )
+
         conn.commit()
         return True, f"예약 완료: 예약 ID {reservation_id}"
     except sqlite3.Error as exc:
@@ -342,17 +553,66 @@ def add_reservation(room_id: str, date: str, start_period: int, end_period: int,
         conn.close()
 
 
-def cancel_reservation(reservation_id: int):
-    """예약 취소. 실제로 삭제된 행이 있을 때만 성공 처리한다."""
+def add_reservation_by_user_name(room_id: str, date: str, start_period: int, end_period: int, user_name: str, purpose: str = ""):
+    """기존 UI 호환용. user_name을 받아 user_id로 변환한 뒤 예약한다."""
+    user = get_user_by_name(user_name)
+    if user is None:
+        ok, msg, user_id = create_user(user_name=user_name, password="1234", role="user")
+        if not ok:
+            return False, msg
+    else:
+        user_id = user[0]
+    return add_reservation(room_id, date, start_period, end_period, user_id, purpose)
+
+
+def cancel_reservation(reservation_id: int, actor_user_id: int | None = None, memo: str = ""):
+    """예약 취소. 취소 내역은 reservation_history에 남긴 뒤 reservations에서 삭제한다."""
     conn = connect_db()
     cur = conn.cursor()
     try:
         cur.execute("BEGIN IMMEDIATE;")
-        cur.execute("DELETE FROM reservations WHERE reservation_id = ?;", (int(reservation_id),))
-        deleted = cur.rowcount
-        if deleted == 0:
+
+        cur.execute(
+            """
+            SELECT reservation_id, room_id, date, day, start_period, end_period, user_id, purpose
+            FROM reservations
+            WHERE reservation_id = ?;
+            """,
+            (int(reservation_id),),
+        )
+        target = cur.fetchone()
+        if not target:
             conn.rollback()
             return False, "예약 취소 실패: 해당 예약 ID를 찾을 수 없습니다."
+
+        rid, room_id, date, day, start_period, end_period, owner_user_id, purpose = target
+        history_user_id = int(actor_user_id) if actor_user_id is not None else owner_user_id
+
+        cur.execute("SELECT user_id FROM users WHERE user_id = ?;", (history_user_id,))
+        if cur.fetchone() is None:
+            conn.rollback()
+            return False, "예약 취소 실패: 존재하지 않는 actor_user_id입니다."
+
+        cur.execute(
+            """
+            INSERT INTO reservation_history
+            (reservation_id, action, room_id, date, day, start_period, end_period, user_id, purpose, memo)
+            VALUES (?, 'CANCEL', ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                rid,
+                room_id,
+                date,
+                day,
+                start_period,
+                end_period,
+                history_user_id,
+                purpose,
+                memo.strip() or "예약 취소",
+            ),
+        )
+
+        cur.execute("DELETE FROM reservations WHERE reservation_id = ?;", (int(reservation_id),))
         conn.commit()
         return True, f"예약 ID {reservation_id}번이 취소되었습니다."
     except sqlite3.Error as exc:
@@ -373,7 +633,7 @@ def get_available_rooms(date: str, start_period: int, end_period: int, min_capac
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT r.room_id, r.building, r.floor, r.room_name, r.capacity, r.room_type,
+        SELECT r.room_id, r.building, r.floor, r.capacity, r.room_type,
                r.location_score, r.accessibility_score, r.priority
         FROM rooms r
         WHERE r.capacity >= ?
@@ -422,8 +682,16 @@ def recommend_alternative_slots(room_id: str, date: str, duration: int, min_star
     return alternatives
 
 
-def add_recurring_reservations(room_id: str, start_date: str, end_date: str, selected_days: Iterable[str],
-                               start_period: int, end_period: int, user_name: str, purpose: str = ""):
+def add_recurring_reservations(
+    room_id: str,
+    start_date: str,
+    end_date: str,
+    selected_days: Iterable[str],
+    start_period: int,
+    end_period: int,
+    user_id: int,
+    purpose: str = "",
+):
     """반복 예약. 일부 실패해도 성공/실패 목록을 모두 반환한다."""
     try:
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
@@ -442,7 +710,7 @@ def add_recurring_reservations(room_id: str, start_date: str, end_date: str, sel
         date_text = cur_dt.strftime("%Y-%m-%d")
         day = get_day_from_date(date_text)
         if day in days:
-            ok, message = add_reservation(room_id, date_text, start_period, end_period, user_name, purpose)
+            ok, message = add_reservation(room_id, date_text, start_period, end_period, user_id, purpose)
             record = {"date": date_text, "day": day, "ok": ok, "message": message}
             if ok:
                 successes.append(record)
@@ -452,7 +720,107 @@ def add_recurring_reservations(room_id: str, start_date: str, end_date: str, sel
     return successes, failures
 
 
+def get_all_reservations():
+    """현재 살아 있는 전체 예약 목록을 사용자명과 함께 반환한다."""
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT rv.reservation_id, rv.room_id, rv.date, rv.day,
+               rv.start_period, rv.end_period,
+               rv.user_id, u.user_name, rv.purpose, rv.created_at
+        FROM reservations rv
+        JOIN users u ON rv.user_id = u.user_id
+        ORDER BY rv.date ASC, rv.start_period ASC, rv.room_id ASC;
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_user_reservations(user_id: int):
+    """특정 사용자의 현재 예약 목록을 반환한다."""
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT rv.reservation_id, rv.room_id, rv.date, rv.day,
+               rv.start_period, rv.end_period,
+               rv.user_id, u.user_name, rv.purpose, rv.created_at
+        FROM reservations rv
+        JOIN users u ON rv.user_id = u.user_id
+        WHERE rv.user_id = ?
+        ORDER BY rv.date ASC, rv.start_period ASC;
+        """,
+        (int(user_id),),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_reservations_by_room_date(room_id: str, date: str):
+    """특정 강의실/날짜의 현재 예약 목록을 반환한다."""
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT rv.reservation_id, rv.room_id, rv.date, rv.day,
+               rv.start_period, rv.end_period,
+               rv.user_id, u.user_name, rv.purpose, rv.created_at
+        FROM reservations rv
+        JOIN users u ON rv.user_id = u.user_id
+        WHERE rv.room_id = ? AND rv.date = ?
+        ORDER BY rv.start_period ASC;
+        """,
+        (room_id, date),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_reservation_history(user_id: int | None = None, room_id: str | None = None, date: str | None = None, limit: int = 100):
+    """예약 생성/취소 이력 조회. 조건을 생략하면 최신 이력부터 반환한다."""
+    conditions = []
+    params: list[object] = []
+
+    if user_id is not None:
+        conditions.append("h.user_id = ?")
+        params.append(int(user_id))
+    if room_id:
+        conditions.append("h.room_id = ?")
+        params.append(room_id)
+    if date:
+        conditions.append("h.date = ?")
+        params.append(date)
+
+    where_sql = "WHERE " + " AND ".join(conditions) if conditions else ""
+    params.append(int(limit))
+
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        SELECT h.history_id, h.reservation_id, h.action,
+               h.room_id, h.date, h.day, h.start_period, h.end_period,
+               h.user_id, u.user_name, h.purpose, h.action_at, h.memo
+        FROM reservation_history h
+        JOIN users u ON h.user_id = u.user_id
+        {where_sql}
+        ORDER BY h.action_at DESC, h.history_id DESC
+        LIMIT ?;
+        """,
+        params,
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
 if __name__ == "__main__":
     ensure_seed_data()
     print("DB 준비 완료")
+    print("사용자 목록:", get_all_users())
     print("예시 사용 가능 강의실:", get_available_rooms("2026-06-01", 5, 7, 30)[:3])

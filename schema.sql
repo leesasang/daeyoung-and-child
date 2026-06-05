@@ -29,6 +29,17 @@ CREATE TABLE IF NOT EXISTS blocked_schedules (
     FOREIGN KEY (room_id) REFERENCES rooms(room_id)
 );
 
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_name TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user',
+    student_id TEXT UNIQUE,
+    department TEXT,
+    email TEXT UNIQUE,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS reservations (
     reservation_id INTEGER PRIMARY KEY AUTOINCREMENT,
     room_id TEXT NOT NULL,
@@ -36,10 +47,28 @@ CREATE TABLE IF NOT EXISTS reservations (
     day TEXT NOT NULL,
     start_period INTEGER NOT NULL,
     end_period INTEGER NOT NULL,
-    user_name TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
     purpose TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (room_id) REFERENCES rooms(room_id)
+    FOREIGN KEY (room_id) REFERENCES rooms(room_id),
+    FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
+CREATE TABLE IF NOT EXISTS reservation_history (
+    history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_id INTEGER,
+    action TEXT NOT NULL CHECK(action IN ('CREATE', 'CANCEL')),
+    room_id TEXT NOT NULL,
+    date TEXT NOT NULL,
+    day TEXT NOT NULL,
+    start_period INTEGER NOT NULL,
+    end_period INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    purpose TEXT,
+    action_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    memo TEXT,
+    FOREIGN KEY (room_id) REFERENCES rooms(room_id),
+    FOREIGN KEY (user_id) REFERENCES users(user_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_blocked_room_day_period
@@ -48,11 +77,26 @@ ON blocked_schedules(room_id, day, period);
 CREATE INDEX IF NOT EXISTS idx_blocked_day_period
 ON blocked_schedules(day, period);
 
+CREATE INDEX IF NOT EXISTS idx_users_user_name
+ON users(user_name);
+
+CREATE INDEX IF NOT EXISTS idx_reservations_user_id
+ON reservations(user_id);
+
 CREATE INDEX IF NOT EXISTS idx_reservations_room_date_period
 ON reservations(room_id, date, start_period, end_period);
 
 CREATE INDEX IF NOT EXISTS idx_reservations_date
 ON reservations(date);
+
+CREATE INDEX IF NOT EXISTS idx_history_user_id
+ON reservation_history(user_id);
+
+CREATE INDEX IF NOT EXISTS idx_history_reservation_id
+ON reservation_history(reservation_id);
+
+CREATE INDEX IF NOT EXISTS idx_history_room_date
+ON reservation_history(room_id, date);
 
 CREATE INDEX IF NOT EXISTS idx_rooms_capacity
 ON rooms(capacity);
