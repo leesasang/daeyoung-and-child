@@ -8,7 +8,7 @@ Team Member C: Admin & Scheduling Manager
 import sqlite3
 from contextlib import contextmanager
 from typing import Optional
-from database_v2 import connect_db, get_day_from_date  # 팀원 A 공통 함수 재사용
+from database_v2 import connect_db  # 팀원 A 공통 함수 재사용
 
 # =====================================================================
 # 상수
@@ -360,3 +360,5 @@ def get_usage_stats(
         by_period = cur.fetchall()
 
     return {'by_room': by_room, 'by_day': by_day, 'by_period': by_period}
+
+
